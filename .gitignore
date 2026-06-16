@@ -1,0 +1,3 @@
+.zero/
+data/*.log
+data/store.json

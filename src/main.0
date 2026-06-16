@@ -1,0 +1,65 @@
+use lib
+
+pub fn main(world: World) -> Void raises {
+    check std.http.listen(world)
+}
+
+// Build {"id":1,"title":"<title>","done":false} into `out`.
+fn buildCreated(title: Span<u8>, out: MutSpan<u8>) -> Maybe<Span<u8>> {
+    var off: usize = 0
+    let a: Maybe<usize> = std.io.writeSpan(out, off, std.mem.span("{\"id\":1,\"title\":\""))
+    if !a.has { return null }
+    off = a.value
+    let b: Maybe<usize> = std.io.writeSpan(out, off, title)
+    if !b.has { return null }
+    off = b.value
+    let c: Maybe<usize> = std.io.writeSpan(out, off, std.mem.span("\",\"done\":false}"))
+    if !c.has { return null }
+    off = c.value
+    return std.io.written(out, off)
+}
+
+fn handle(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    if std.http.requestIsGet(request, "/health") {
+        return std.http.writeJsonOk(response, "{\"status\":\"ok\"}")
+    }
+
+    // Read-backed list: re-reads the store file on every request (real fs I/O).
+    if std.http.requestIsGet(request, "/todos") {
+        var store: [4096]u8 = [0_u8; 4096]
+        let got: Maybe<usize> = std.fs.readBytes("/Users/osa/projects/zerolang/data/store.json", store)
+        if got.has {
+            var n: usize = got.value
+            if n > 4096 { n = 4096 }
+            let view: Span<u8> = std.mem.prefix(store, n)
+            return std.http.writeJsonOk(response, view)
+        }
+        return std.http.writeJsonOk(response, "[]")
+    }
+
+    if std.http.requestIsPost(request, "/todos") {
+        let body: Maybe<Span<u8>> = std.http.requestJsonBodyWithin(request, 512)
+        if !body.has {
+            return std.http.writeJsonBadRequest(response, "{\"error\":\"expected_json_body\"}")
+        }
+        var titlebuf: [128]u8 = [0_u8; 128]
+        let title: Maybe<Span<u8>> = std.json.string(titlebuf, body.value, std.mem.span("title"))
+        if !title.has {
+            return std.http.writeJsonBadRequest(response, "{\"error\":\"missing_title\"}")
+        }
+        var bodybuf: [256]u8 = [0_u8; 256]
+        let created: Maybe<Span<u8>> = buildCreated(title.value, bodybuf)
+        if !created.has {
+            return std.http.writeJsonInternalServerError(response, "{\"error\":\"encode_failed\"}")
+        }
+        return std.http.writeJsonCreated(response, created.value)
+    }
+
+    if std.http.requestIsPatch(request, "/todos/1") {
+        return std.http.writeJsonOk(response, "{\"id\":1,\"done\":true}")
+    }
+    if std.http.requestIsDelete(request, "/todos/1") {
+        return std.http.writeNoContent(response)
+    }
+    return std.http.writeJsonNotFound(response, "{\"error\":\"not_found\"}")
+}
