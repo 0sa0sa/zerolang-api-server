@@ -1,3 +1,4 @@
 .zero/
 data/*.log
 data/store.json
+__pycache__/
