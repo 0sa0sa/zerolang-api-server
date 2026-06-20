@@ -1,52 +1,97 @@
+// ============================================================================
+// Todo BE — Zero (zerolang 0.3.4) の読み取りバックエンド + HTTPルーター。
+//
+// この `.0` ファイルは「プロジェクション」= プログラムの人間向け表示。
+// 実際のコンパイラ入力は zero.graph で、編集後に `zero check` がグラフを
+// この source から再構築する。コメントはこのプロジェクションに置く。
+//
+// システム内の役割(README参照): このプロセスは READ(GET) を担当し、
+// リクエストボディを解析する。macOS/arm64 ホストでは書き込み永続化が
+// できないため、保存は writer.py が担う。起動はすべて run.sh 経由。
+// ============================================================================
+
 use lib
 
+// プログラムのエントリポイント。`World` はランタイム権限(I/O)の束で、これを
+// 引数に取ることで「副作用がある」とシグネチャ上に明示される。`raises` は
+// 失敗しうる関数の印、`check` は失敗しうる呼び出しを実行し失敗を呼び出し元へ
+// 伝播する。
 pub fn main(world: World) -> Void raises {
+    // ホストHTTPリスナを起動(ポート3000、使用中なら自動で繰り上げ)。
+    // リクエストは規約により `handle` という名前の関数へ振り分けられる。
     check std.http.listen(world)
 }
 
-// Build {"id":1,"title":"<title>","done":false} into `out`.
+// {"id":1,"title":"<title>","done":false} を呼び出し側のバッファ `out` に
+// 組み立てる。Zero は「自分のローカル配列を指す Span を返すこと」を禁止
+// (ダングリング防止)するため、書き込み先は引数で受け取り、その `out` への
+// ビューを返す。
 fn buildCreated(title: Span<u8>, out: MutSpan<u8>) -> Maybe<Span<u8>> {
     var off: usize = 0
+    // writeSpan は `off` の位置に書き込み、新しいオフセットを返す。バッファが
+    // 一杯なら null。各書き込みで `off` を継ぎ、null なら打ち切る。
     let a: Maybe<usize> = std.io.writeSpan(out, off, std.mem.span("{\"id\":1,\"title\":\""))
     if !a.has { return null }
     off = a.value
+    // リクエストから取り出した動的な title のバイト列
     let b: Maybe<usize> = std.io.writeSpan(out, off, title)
     if !b.has { return null }
     off = b.value
     let c: Maybe<usize> = std.io.writeSpan(out, off, std.mem.span("\",\"done\":false}"))
     if !c.has { return null }
     off = c.value
+    // `out` に書き込んだ [0, off) のバイトだけを覆う Span を返す
     return std.io.written(out, off)
 }
 
+// HTTPディスパッチャ。リクエストごとに1回呼ばれる。
+//   request  — 生のリクエストバイト列の読み取り専用ビュー(Span)
+//   response — 応答を書き込むためにランタイムが渡す可変バッファ(MutSpan)
+// 書き込んだ応答スライス、失敗時は null を返す。ここには意図的に `World` も
+// 状態引数も無い: ハンドラはステートレス。
 fn handle(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    // ---- GET /health: 生存確認 ------------------------------------------
     if std.http.requestIsGet(request, "/health") {
         return std.http.writeJsonOk(response, "{\"status\":\"ok\"}")
     }
 
-    // Read-backed list: re-reads the store file on every request (real fs I/O).
+    // ---- GET /todos: 一覧。毎回ディスクから読み直す ---------------------
+    // 毎リクエストの実ファイルI/O: writer.py が store.json に最後に保存した
+    // 内容をそのまま返すので、読み取りは常に最新状態を反映する。
     if std.http.requestIsGet(request, "/todos") {
+        // 4 KiB バッファをスタックに確保 — Zero は GC も隠れヒープも無い。
         var store: [4096]u8 = [0_u8; 4096]
         let got: Maybe<usize> = std.fs.readBytes("/Users/osa/projects/zerolang/data/store.json", store)
+        // readBytes はファイルの「総バイト数」を返す(snprintf 方式)ので、
+        // バッファを超えることがある。`.has` でガードし容量にクランプする。
         if got.has {
             var n: usize = got.value
             if n > 4096 { n = 4096 }
+            // 有効バイトだけにビューを絞り、JSON として送る
             let view: Span<u8> = std.mem.prefix(store, n)
             return std.http.writeJsonOk(response, view)
         }
+        // store ファイルが無ければ空リストを返す
         return std.http.writeJsonOk(response, "[]")
     }
 
+    // ---- POST /todos: ボディから {"title": "..."} を解析 ----------------
+    // 実際のボディ解析のデモ。保存は writer.py の役割で、ここでは入力検証して
+    // 生成オブジェクトをエコーバックする。
     if std.http.requestIsPost(request, "/todos") {
+        // リクエストボディを取得(上限 512 バイト)
         let body: Maybe<Span<u8>> = std.http.requestJsonBodyWithin(request, 512)
         if !body.has {
             return std.http.writeJsonBadRequest(response, "{\"error\":\"expected_json_body\"}")
         }
+        // デコードした "title" 文字列用のスクラッチバッファ
         var titlebuf: [128]u8 = [0_u8; 128]
+        // ボディから "title" フィールドを取り出し JSON デコードして titlebuf へ
         let title: Maybe<Span<u8>> = std.json.string(titlebuf, body.value, std.mem.span("title"))
         if !title.has {
             return std.http.writeJsonBadRequest(response, "{\"error\":\"missing_title\"}")
         }
+        // これから組み立てる応答 JSON 用のスクラッチバッファ
         var bodybuf: [256]u8 = [0_u8; 256]
         let created: Maybe<Span<u8>> = buildCreated(title.value, bodybuf)
         if !created.has {
@@ -55,11 +100,16 @@ fn handle(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
         return std.http.writeJsonCreated(response, created.value)
     }
 
+    // ---- PATCH/DELETE: 実運用では writer.py が処理 ----------------------
+    // Zero サーバー単体でも完結するよう残してある。これらの公開CRUD(実id+
+    // 永続化)はサイドカーが担当する。
     if std.http.requestIsPatch(request, "/todos/1") {
         return std.http.writeJsonOk(response, "{\"id\":1,\"done\":true}")
     }
     if std.http.requestIsDelete(request, "/todos/1") {
         return std.http.writeNoContent(response)
     }
+
+    // ---- フォールスルー: 不明なルート ----------------------------------
     return std.http.writeJsonNotFound(response, "{\"error\":\"not_found\"}")
 }
